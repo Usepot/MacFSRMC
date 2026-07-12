@@ -1,0 +1,11 @@
+.gradle/
+.idea/
+build/
+run/
+out/
+*.iml
+*.log
+.DS_Store
+cmake-build-*/
+native/build/
+

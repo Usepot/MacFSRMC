@@ -1,0 +1,122 @@
+plugins {
+    id "net.fabricmc.fabric-loom" version "${loom_version}"
+    id "maven-publish"
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+loom {
+    splitEnvironmentSourceSets()
+
+    mods {
+        macfsrmc {
+            sourceSet sourceSets.main
+            sourceSet sourceSets.client
+        }
+    }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+    testImplementation platform("org.junit:junit-bom:5.13.4")
+    testImplementation "org.junit.jupiter:junit-jupiter"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+}
+
+sourceSets {
+    test {
+        compileClasspath += sourceSets.client.output + sourceSets.client.compileClasspath
+        runtimeClasspath += sourceSets.client.output + sourceSets.client.runtimeClasspath
+    }
+}
+
+tasks.named("test", Test) {
+    dependsOn tasks.named("clientClasses")
+    useJUnitPlatform()
+}
+
+def nativeRoot = layout.projectDirectory.dir("native")
+def nativeOutput = layout.buildDirectory.dir("native/natives")
+def hostOs = org.gradle.internal.os.OperatingSystem.current()
+
+tasks.register("buildNativeWindows", Exec) {
+    group = "build"
+    description = "Builds the Windows x86-64 JNI bridge and the official FSR 2.2.1 Vulkan backend."
+    onlyIf { hostOs.isWindows() }
+    inputs.dir(nativeRoot)
+    outputs.file(nativeOutput.map { it.file("windows-x86_64/macfsrmc_fsr2.dll") })
+    commandLine "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+        nativeRoot.file("build-windows.ps1").asFile.absolutePath,
+        "-ProjectRoot", project.projectDir.absolutePath,
+        "-OutputRoot", nativeOutput.get().asFile.absolutePath
+}
+
+tasks.register("buildNativeUnix", Exec) {
+    group = "build"
+    description = "Builds the macOS/Linux JNI bridge and the official FSR 2.2.1 Vulkan backend."
+    onlyIf { !hostOs.isWindows() }
+    inputs.dir(nativeRoot)
+    outputs.dir(nativeOutput)
+    commandLine "bash", nativeRoot.file("build-unix.sh").asFile.absolutePath,
+        project.projectDir.absolutePath, nativeOutput.get().asFile.absolutePath
+}
+
+tasks.register("buildNative") {
+    group = "build"
+    description = "Builds the host-native FSR 2 bridge."
+    dependsOn hostOs.isWindows() ? "buildNativeWindows" : "buildNativeUnix"
+}
+
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+
+    if (!project.hasProperty("skipNative")) {
+        dependsOn tasks.named("buildNative")
+    }
+    from(nativeOutput) {
+        into "natives"
+        include "**/*.dll", "**/*.dylib", "**/*.so"
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 25
+}
+
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+}
+
+jar {
+    from("LICENSE") {
+        rename { "${it}_${project.base.archivesName.get()}" }
+    }
+    from("native/third_party/fsr2/LICENSE.txt") {
+        into "META-INF/licenses/fsr2"
+    }
+    from("native/third_party/vulkan/LICENSE.md") {
+        into "META-INF/licenses/vulkan-headers"
+    }
+}
+
+publishing {
+    publications {
+        create("mavenJava", MavenPublication) {
+            artifactId = project.archives_base_name
+            from components.java
+        }
+    }
+}
