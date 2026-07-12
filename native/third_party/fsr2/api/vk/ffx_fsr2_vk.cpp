@@ -723,59 +723,13 @@ FfxErrorCode GetDeviceCapabilitiesVK(FfxFsr2Interface* backendInterface, FfxDevi
     deviceCapabilities->fp16Supported = false;
     deviceCapabilities->raytracingSupported = false;
 
-    // check if extensions are enabled
-
-    for (uint32_t i = 0; i < backendContext->numDeviceExtensions; i++)
-    {
-        if (strcmp(backendContext->extensionProperties[i].extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME) == 0)
-        {
-            // check if we the max subgroup size allows us to use wave64
-            VkPhysicalDeviceSubgroupSizeControlProperties subgroupSizeControlProperties = {};
-            subgroupSizeControlProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
-
-            VkPhysicalDeviceProperties2 deviceProperties2 = {};
-            deviceProperties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-            deviceProperties2.pNext = &subgroupSizeControlProperties;
-            macfsr_vkGetPhysicalDeviceProperties2(backendContext->physicalDevice, &deviceProperties2);
-
-            // NOTE: It's important to check requiredSubgroupSizeStages flags (and it's required by the spec).
-            // As of August 2022, AMD's Vulkan drivers do not support subgroup size selection through Vulkan API
-            // and this information is reported through requiredSubgroupSizeStages flags.
-            if (subgroupSizeControlProperties.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)
-            {
-                deviceCapabilities->waveLaneCountMin = subgroupSizeControlProperties.minSubgroupSize;
-                deviceCapabilities->waveLaneCountMax = subgroupSizeControlProperties.maxSubgroupSize;
-            }
-        }
-        if (strcmp(backendContext->extensionProperties[i].extensionName, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME) == 0)
-        {
-            // check for fp16 support
-            VkPhysicalDeviceShaderFloat16Int8Features shaderFloat18Int8Features = {};
-            shaderFloat18Int8Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
-
-            VkPhysicalDeviceFeatures2 physicalDeviceFeatures2 = {};
-            physicalDeviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-            physicalDeviceFeatures2.pNext = &shaderFloat18Int8Features;
-
-            macfsr_vkGetPhysicalDeviceFeatures2(backendContext->physicalDevice, &physicalDeviceFeatures2);
-
-            deviceCapabilities->fp16Supported = (bool)shaderFloat18Int8Features.shaderFloat16;
-        }
-        if (strcmp(backendContext->extensionProperties[i].extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) == 0)
-        {
-            // check for ray tracing support 
-            VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures = {};
-            accelerationStructureFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
-
-            VkPhysicalDeviceFeatures2 physicalDeviceFeatures2 = {};
-            physicalDeviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-            physicalDeviceFeatures2.pNext = &accelerationStructureFeatures;
-
-            macfsr_vkGetPhysicalDeviceFeatures2(backendContext->physicalDevice, &physicalDeviceFeatures2);
-
-            deviceCapabilities->raytracingSupported = (bool)accelerationStructureFeatures.accelerationStructure;
-        }
-    }
+    // This backend is attached to Minecraft's already-created VkDevice. Vulkan
+    // does not expose which optional features were enabled on that device, and
+    // enumerating physical-device extensions only reports support. Advertising
+    // supported-but-not-enabled FP16, subgroup-size control, or ray tracing can
+    // make the SDK select an illegal pipeline permutation. Keep those optional
+    // paths conservative; the default subgroup size and FP32 permutations work
+    // on the feature set explicitly enabled by Minecraft.
 
     return FFX_OK;
 }

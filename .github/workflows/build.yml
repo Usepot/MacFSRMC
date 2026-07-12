@@ -1,0 +1,208 @@
+name: Build and package
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  platform-build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x86-64
+            runner: windows-2025
+            platform: windows-x86_64
+            library: macfsrmc_fsr2.dll
+          - name: Linux x86-64
+            runner: ubuntu-24.04
+            platform: linux-x86_64
+            library: libmacfsrmc_fsr2.so
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+            platform: linux-aarch64
+            library: libmacfsrmc_fsr2.so
+          - name: macOS Apple Silicon
+            runner: macos-15
+            platform: macos-aarch64
+            library: libmacfsrmc_fsr2.dylib
+          - name: macOS Intel
+            runner: macos-15-intel
+            platform: macos-x86_64
+            library: libmacfsrmc_fsr2.dylib
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build, test, and package on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\gradlew.bat --no-daemon clean build
+
+      - name: Build, test, and package on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon clean build
+
+      - name: Verify and stage Windows native
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $native = "build/native/natives/${{ matrix.platform }}/${{ matrix.library }}"
+          if (-not (Test-Path -LiteralPath $native -PathType Leaf)) {
+            throw "Expected native library was not built: $native"
+          }
+
+          $modJar = Get-ChildItem build/libs/macfsrmc-*.jar |
+            Where-Object Name -NotLike '*-sources.jar' |
+            Select-Object -First 1
+          if (-not $modJar) {
+            throw 'The remapped Fabric mod jar was not produced.'
+          }
+
+          $entry = "natives/${{ matrix.platform }}/${{ matrix.library }}"
+          $jarEntries = & jar tf $modJar.FullName
+          if ($jarEntries -notcontains $entry) {
+            throw "$entry is missing from $($modJar.FullName)"
+          }
+
+          $staging = "build/ci-native/natives/${{ matrix.platform }}"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item -LiteralPath $native -Destination $staging
+
+      - name: Verify and stage Unix native
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          native="build/native/natives/${{ matrix.platform }}/${{ matrix.library }}"
+          test -f "$native"
+
+          mod_jar="$(find build/libs -maxdepth 1 -type f -name 'macfsrmc-*.jar' ! -name '*-sources.jar' -print -quit)"
+          test -n "$mod_jar"
+          jar_entries="$(jar tf "$mod_jar")"
+          grep -Fxq "natives/${{ matrix.platform }}/${{ matrix.library }}" <<<"$jar_entries"
+
+          staging="build/ci-native/natives/${{ matrix.platform }}"
+          mkdir -p "$staging"
+          cp "$native" "$staging/"
+
+      - name: Upload platform native
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.platform }}
+          path: build/ci-native/natives
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload platform mod jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: macfsrmc-${{ matrix.platform }}
+          path: |
+            build/libs/macfsrmc-*.jar
+            !build/libs/*-sources.jar
+          if-no-files-found: error
+          retention-days: 14
+
+  universal-jar:
+    name: Universal release jar
+    needs: platform-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build and test the native-free base jar
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon clean build -PskipNative
+
+      - name: Download every platform native
+        uses: actions/download-artifact@v5
+        with:
+          pattern: native-*
+          path: universal-root/natives
+          merge-multiple: true
+
+      - name: Assemble and verify universal jar
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          expected=(
+            "natives/windows-x86_64/macfsrmc_fsr2.dll"
+            "natives/linux-x86_64/libmacfsrmc_fsr2.so"
+            "natives/linux-aarch64/libmacfsrmc_fsr2.so"
+            "natives/macos-aarch64/libmacfsrmc_fsr2.dylib"
+            "natives/macos-x86_64/libmacfsrmc_fsr2.dylib"
+          )
+          for entry in "${expected[@]}"; do
+            test -f "universal-root/$entry"
+          done
+
+          base_jar="$(find build/libs -maxdepth 1 -type f -name 'macfsrmc-*.jar' ! -name '*-sources.jar' -print -quit)"
+          test -n "$base_jar"
+          mkdir -p dist
+          universal_jar="dist/$(basename "${base_jar%.jar}")-universal.jar"
+          cp "$base_jar" "$universal_jar"
+          jar --update --file "$universal_jar" -C universal-root natives
+
+          jar_entries="$(jar tf "$universal_jar")"
+          for entry in "${expected[@]}"; do
+            grep -Fxq "$entry" <<<"$jar_entries"
+          done
+          runtime_native_count="$(grep -Ec '^natives/.+\.(dll|so|dylib)$' <<<"$jar_entries")"
+          test "$runtime_native_count" -eq "${#expected[@]}"
+
+          (
+            cd dist
+            sha256sum "$(basename "$universal_jar")" > "$(basename "$universal_jar").sha256"
+          )
+
+      - name: Upload universal release jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: macfsrmc-universal
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30

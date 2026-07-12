@@ -58,50 +58,60 @@ void clearFunctions() {
 }
 }
 
-extern "C" bool macfsr_load_vulkan(VkInstance instance, VkDevice device) {
+extern "C" bool macfsr_load_vulkan(
+    VkInstance instance,
+    VkDevice device,
+    PFN_vkGetInstanceProcAddr suppliedGetInstanceProcAddr
+) {
     if (g_getDeviceProcAddr != nullptr) {
         return true;
     }
 
+    // LWJGL already owns the loader used to create Minecraft's VkInstance.
+    // Prefer its exact function pointer so MoltenVK does not need to be visible
+    // through RTLD_DEFAULT or discoverable at a guessed filesystem location.
+    g_getInstanceProcAddr = suppliedGetInstanceProcAddr;
+    if (g_getInstanceProcAddr == nullptr) {
 #if defined(_WIN32)
-    g_library = GetModuleHandleW(L"vulkan-1.dll");
-    if (g_library == nullptr) {
-        g_library = LoadLibraryW(L"vulkan-1.dll");
-        g_ownsLibrary = g_library != nullptr;
-    }
+        g_library = GetModuleHandleW(L"vulkan-1.dll");
+        if (g_library == nullptr) {
+            g_library = LoadLibraryW(L"vulkan-1.dll");
+            g_ownsLibrary = g_library != nullptr;
+        }
 #else
-    constexpr std::array<const char*, 6> candidates = {
+        constexpr std::array<const char*, 6> candidates = {
 #if defined(__APPLE__)
-        "libMoltenVK.dylib",
-        "libvulkan.1.dylib",
-        "libvulkan.dylib",
-        "@rpath/libMoltenVK.dylib",
-        "/usr/local/lib/libMoltenVK.dylib",
-        "/opt/homebrew/lib/libMoltenVK.dylib"
+            "libMoltenVK.dylib",
+            "libvulkan.1.dylib",
+            "libvulkan.dylib",
+            "@rpath/libMoltenVK.dylib",
+            "/usr/local/lib/libMoltenVK.dylib",
+            "/opt/homebrew/lib/libMoltenVK.dylib"
 #else
-        "libvulkan.so.1",
-        "libvulkan.so",
-        "libMoltenVK.so",
-        "/usr/lib/libvulkan.so.1",
-        "/usr/local/lib/libvulkan.so.1",
-        ""
+            "libvulkan.so.1",
+            "libvulkan.so",
+            "libMoltenVK.so",
+            "/usr/lib/libvulkan.so.1",
+            "/usr/local/lib/libvulkan.so.1",
+            ""
 #endif
-    };
-    if (dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr") == nullptr) {
-        for (const char* candidate : candidates) {
-            if (candidate[0] == '\0') {
-                continue;
-            }
-            g_library = dlopen(candidate, RTLD_NOW | RTLD_LOCAL);
-            if (g_library != nullptr) {
-                g_ownsLibrary = true;
-                break;
+        };
+        if (dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr") == nullptr) {
+            for (const char* candidate : candidates) {
+                if (candidate[0] == '\0') {
+                    continue;
+                }
+                g_library = dlopen(candidate, RTLD_NOW | RTLD_LOCAL);
+                if (g_library != nullptr) {
+                    g_ownsLibrary = true;
+                    break;
+                }
             }
         }
-    }
 #endif
 
-    g_getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(findSymbol("vkGetInstanceProcAddr"));
+        g_getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(findSymbol("vkGetInstanceProcAddr"));
+    }
     if (g_getInstanceProcAddr == nullptr) {
         g_error = "Could not resolve vkGetInstanceProcAddr from Minecraft's Vulkan loader";
         macfsr_unload_vulkan();
@@ -198,4 +208,3 @@ extern "C" void VKAPI_PTR macfsr_vkGetPhysicalDeviceFeatures2(
 ) {
     g_getPhysicalDeviceFeatures2(physicalDevice, features);
 }
-

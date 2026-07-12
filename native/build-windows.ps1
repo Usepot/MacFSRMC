@@ -58,7 +58,7 @@ $includes = @(
 )
 
 $dll = Join-Path $outputDirectory 'macfsrmc_fsr2.dll'
-$arguments = @('/nologo', '/std:c++17', '/O2', '/EHsc', '/MD', '/LD', '/utf-8', '/permissive-', '/Zc:__cplusplus', '/W3')
+$arguments = @('/nologo', '/std:c++17', '/O2', '/EHsc', '/MT', '/LD', '/utf-8', '/permissive-', '/Zc:__cplusplus', '/W3')
 $arguments += "/FI$(Join-Path $nativeRoot 'src\macfsr_portability.h')"
 $arguments += $includes | ForEach-Object { "/I$_" }
 $arguments += $sources
@@ -77,4 +77,3 @@ if (-not (Test-Path -LiteralPath $dll)) {
     throw "Native compiler did not create $dll"
 }
 Write-Host "Built $dll"
-

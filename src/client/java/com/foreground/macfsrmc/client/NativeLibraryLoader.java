@@ -81,14 +81,14 @@ final class NativeLibraryLoader {
                 throw new IOException("Unsupported CPU architecture: " + arch);
             }
 
-            if (os.contains("win")) {
+            if (os.contains("mac") || os.contains("darwin")) {
+                return new Platform(arm64 ? "macos-aarch64" : "macos-x86_64", "libmacfsrmc_fsr2.dylib");
+            }
+            if (os.startsWith("windows")) {
                 if (!x64) {
                     throw new IOException("Windows ARM64 is not currently packaged");
                 }
                 return new Platform("windows-x86_64", "macfsrmc_fsr2.dll");
-            }
-            if (os.contains("mac") || os.contains("darwin")) {
-                return new Platform(arm64 ? "macos-aarch64" : "macos-x86_64", "libmacfsrmc_fsr2.dylib");
             }
             if (os.contains("linux")) {
                 return new Platform(arm64 ? "linux-aarch64" : "linux-x86_64", "libmacfsrmc_fsr2.so");
@@ -97,4 +97,3 @@ final class NativeLibraryLoader {
         }
     }
 }
-

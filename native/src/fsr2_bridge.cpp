@@ -77,6 +77,7 @@ struct BridgeContext {
 
     FfxFsr2Context fsr{};
     bool fsrCreated = false;
+    bool fsrResourcesPoisoned = false;
     std::vector<uint8_t> scratch;
     uint32_t renderWidth = 0;
     uint32_t renderHeight = 0;
@@ -90,6 +91,8 @@ struct BridgeContext {
     VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    VkImageView descriptorColorView = VK_NULL_HANDLE;
+    VkImageView descriptorDepthView = VK_NULL_HANDLE;
     VkPipelineLayout motionPipelineLayout = VK_NULL_HANDLE;
     VkPipeline motionPipeline = VK_NULL_HANDLE;
 };
@@ -326,6 +329,8 @@ void destroyMotionPipeline() {
     g_context.descriptorPool = VK_NULL_HANDLE;
     g_context.descriptorSetLayout = VK_NULL_HANDLE;
     g_context.descriptorSet = VK_NULL_HANDLE;
+    g_context.descriptorColorView = VK_NULL_HANDLE;
+    g_context.descriptorDepthView = VK_NULL_HANDLE;
     g_context.sampler = VK_NULL_HANDLE;
 }
 
@@ -444,6 +449,7 @@ void destroyFsrResources() {
     destroyImage(g_context.motion);
     destroyImage(g_context.reactive);
     g_context.scratch.clear();
+    g_context.fsrResourcesPoisoned = false;
     g_context.renderWidth = 0;
     g_context.renderHeight = 0;
     g_context.displayWidth = 0;
@@ -452,6 +458,7 @@ void destroyFsrResources() {
 
 bool createFsrResources(uint32_t renderWidth, uint32_t renderHeight, uint32_t displayWidth, uint32_t displayHeight) {
     if (g_context.fsrCreated
+        && !g_context.fsrResourcesPoisoned
         && g_context.renderWidth == renderWidth
         && g_context.renderHeight == renderHeight
         && g_context.displayWidth == displayWidth
@@ -533,10 +540,27 @@ bool createFsrResources(uint32_t renderWidth, uint32_t renderHeight, uint32_t di
     g_context.renderHeight = renderHeight;
     g_context.displayWidth = displayWidth;
     g_context.displayHeight = displayHeight;
+    g_context.fsrResourcesPoisoned = false;
     return true;
 }
 
-void updateMotionDescriptors(VkImageView colorView, VkImageView depthView) {
+bool updateMotionDescriptors(VkImageView colorView, VkImageView depthView) {
+    if (g_context.descriptorColorView == colorView && g_context.descriptorDepthView == depthView) {
+        return true;
+    }
+
+    // Descriptor sets without UPDATE_AFTER_BIND may not be changed while a
+    // prior submission still references them. TextureTarget normally keeps the
+    // same views for its lifetime, so this is paid only on first use or an
+    // unexpected same-size target replacement.
+    if (g_context.descriptorColorView != VK_NULL_HANDLE || g_context.descriptorDepthView != VK_NULL_HANDLE) {
+        VkResult idleResult = g_context.vk.deviceWaitIdle(g_context.device);
+        if (idleResult != VK_SUCCESS) {
+            setError(resultMessage("vkDeviceWaitIdle before descriptor update", idleResult));
+            return false;
+        }
+    }
+
     std::array<VkDescriptorImageInfo, 4> images{};
     images[0] = {g_context.sampler, depthView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     images[1] = {g_context.sampler, colorView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -552,9 +576,12 @@ void updateMotionDescriptors(VkImageView colorView, VkImageView depthView) {
         writes[index].pImageInfo = &images[index];
     }
     g_context.vk.updateDescriptorSets(g_context.device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    g_context.descriptorColorView = colorView;
+    g_context.descriptorDepthView = depthView;
+    return true;
 }
 
-void recordMotionPass(
+bool recordMotionPass(
     VkCommandBuffer commandBuffer,
     VkImage color,
     VkImageView colorView,
@@ -562,6 +589,10 @@ void recordMotionPass(
     VkImageView depthView,
     const MotionPushConstants& pushConstants
 ) {
+    if (!updateMotionDescriptors(colorView, depthView)) {
+        return false;
+    }
+
     transitionOwnedImageToGeneral(commandBuffer, g_context.output);
     transitionOwnedImageToGeneral(commandBuffer, g_context.motion);
     transitionOwnedImageToGeneral(commandBuffer, g_context.reactive);
@@ -587,8 +618,6 @@ void recordMotionPass(
         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
         VK_ACCESS_SHADER_READ_BIT
     );
-
-    updateMotionDescriptors(colorView, depthView);
     g_context.vk.cmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, g_context.motionPipeline);
     g_context.vk.cmdBindDescriptorSets(
         commandBuffer,
@@ -631,6 +660,7 @@ void recordMotionPass(
         VK_ACCESS_SHADER_WRITE_BIT,
         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
     );
+    return true;
 }
 
 bool recordFsrDispatch(
@@ -718,6 +748,83 @@ bool recordFsrDispatch(
         return false;
     }
     return true;
+}
+
+void recordNativeFallbackBlit(
+    VkCommandBuffer commandBuffer,
+    VkImage source,
+    VkImage destination,
+    uint32_t sourceWidth,
+    uint32_t sourceHeight,
+    uint32_t destinationWidth,
+    uint32_t destinationHeight,
+    VkImageLayout sourceOldLayout,
+    VkPipelineStageFlags sourceStage,
+    VkAccessFlags sourceAccess
+) {
+    transitionImage(
+        commandBuffer,
+        source,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        sourceOldLayout,
+        VK_IMAGE_LAYOUT_GENERAL,
+        sourceStage,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        sourceAccess,
+        VK_ACCESS_TRANSFER_READ_BIT
+    );
+    transitionImage(
+        commandBuffer,
+        destination,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        VK_IMAGE_LAYOUT_GENERAL,
+        VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT
+    );
+
+    VkImageBlit region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.srcOffsets[0] = {0, 0, 0};
+    region.srcOffsets[1] = {static_cast<int32_t>(sourceWidth), static_cast<int32_t>(sourceHeight), 1};
+    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstOffsets[0] = {0, 0, 0};
+    region.dstOffsets[1] = {static_cast<int32_t>(destinationWidth), static_cast<int32_t>(destinationHeight), 1};
+    g_context.vk.cmdBlitImage(
+        commandBuffer,
+        source,
+        VK_IMAGE_LAYOUT_GENERAL,
+        destination,
+        VK_IMAGE_LAYOUT_GENERAL,
+        1,
+        &region,
+        VK_FILTER_LINEAR
+    );
+
+    transitionImage(
+        commandBuffer,
+        source,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        VK_IMAGE_LAYOUT_GENERAL,
+        VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_ACCESS_TRANSFER_READ_BIT,
+        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT
+    );
+    transitionImage(
+        commandBuffer,
+        destination,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        VK_IMAGE_LAYOUT_GENERAL,
+        VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT
+    );
 }
 
 void restoreAndBlit(
@@ -843,12 +950,16 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_foreground_macfsrmc_client_Fsr2Na
     jlong instanceHandle,
     jlong physicalDeviceHandle,
     jlong deviceHandle,
+    jlong getInstanceProcAddrHandle,
     jboolean debugLogging
 ) {
     std::lock_guard lock(g_mutex);
     VkInstance instance = reinterpret_cast<VkInstance>(static_cast<uintptr_t>(instanceHandle));
     VkPhysicalDevice physicalDevice = reinterpret_cast<VkPhysicalDevice>(static_cast<uintptr_t>(physicalDeviceHandle));
     VkDevice device = reinterpret_cast<VkDevice>(static_cast<uintptr_t>(deviceHandle));
+    PFN_vkGetInstanceProcAddr suppliedGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+        static_cast<uintptr_t>(getInstanceProcAddrHandle)
+    );
     if (instance == VK_NULL_HANDLE || physicalDevice == VK_NULL_HANDLE || device == VK_NULL_HANDLE) {
         setError("A required Vulkan handle was null");
         return JNI_FALSE;
@@ -868,7 +979,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_foreground_macfsrmc_client_Fsr2Na
     g_context.physicalDevice = physicalDevice;
     g_context.device = device;
     g_context.debug = debugLogging == JNI_TRUE;
-    if (!macfsr_load_vulkan(instance, device)) {
+    if (!macfsr_load_vulkan(instance, device, suppliedGetInstanceProcAddr)) {
         setError(macfsr_vulkan_error());
         g_context = {};
         return JNI_FALSE;
@@ -932,7 +1043,19 @@ extern "C" JNIEXPORT jint JNICALL Java_com_foreground_macfsrmc_client_Fsr2Native
     }
 
     if (!createFsrResources(inputWidth, inputHeight, outputWidth, outputHeight)) {
-        return 0;
+        recordNativeFallbackBlit(
+            commandBuffer,
+            color,
+            destination,
+            static_cast<uint32_t>(inputWidth),
+            static_cast<uint32_t>(inputHeight),
+            static_cast<uint32_t>(outputWidth),
+            static_cast<uint32_t>(outputHeight),
+            VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_ACCESS_MEMORY_WRITE_BIT
+        );
+        return 2;
     }
 
     MotionPushConstants pushConstants{};
@@ -940,14 +1063,40 @@ extern "C" JNIEXPORT jint JNICALL Java_com_foreground_macfsrmc_client_Fsr2Native
     if (environment->ExceptionCheck()) {
         environment->ExceptionClear();
         setError("Could not read the temporal reprojection matrix");
-        return 0;
+        recordNativeFallbackBlit(
+            commandBuffer,
+            color,
+            destination,
+            static_cast<uint32_t>(inputWidth),
+            static_cast<uint32_t>(inputHeight),
+            static_cast<uint32_t>(outputWidth),
+            static_cast<uint32_t>(outputHeight),
+            VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_ACCESS_MEMORY_WRITE_BIT
+        );
+        return 2;
     }
     pushConstants.inverseRenderSize[0] = 1.0F / static_cast<float>(inputWidth);
     pushConstants.inverseRenderSize[1] = 1.0F / static_cast<float>(inputHeight);
     pushConstants.reactiveScale = useReactiveMask == JNI_TRUE ? std::clamp(reactiveScale, 0.0F, 1.0F) : 0.0F;
     pushConstants.resetHistory = reset == JNI_TRUE ? 1u : 0u;
 
-    recordMotionPass(commandBuffer, color, colorView, depth, depthView, pushConstants);
+    if (!recordMotionPass(commandBuffer, color, colorView, depth, depthView, pushConstants)) {
+        recordNativeFallbackBlit(
+            commandBuffer,
+            color,
+            destination,
+            static_cast<uint32_t>(inputWidth),
+            static_cast<uint32_t>(inputHeight),
+            static_cast<uint32_t>(outputWidth),
+            static_cast<uint32_t>(outputHeight),
+            VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_ACCESS_MEMORY_WRITE_BIT
+        );
+        return 2;
+    }
     if (!recordFsrDispatch(
         commandBuffer,
         color,
@@ -961,7 +1110,36 @@ extern "C" JNIEXPORT jint JNICALL Java_com_foreground_macfsrmc_client_Fsr2Native
         reset == JNI_TRUE,
         verticalFov
     )) {
-        return 0;
+        // Color and depth are dynamic read-only FSR resources, so their layout
+        // remains known even if the SDK aborts after recording only part of its
+        // pass list. Internal and generated images may be in any SDK-tracked
+        // layout; poison the context and rebuild it after device idle instead
+        // of guessing those layouts on the next frame.
+        transitionImage(
+            commandBuffer,
+            depth,
+            VK_IMAGE_ASPECT_DEPTH_BIT,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_ACCESS_SHADER_READ_BIT,
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT
+        );
+        recordNativeFallbackBlit(
+            commandBuffer,
+            color,
+            destination,
+            static_cast<uint32_t>(inputWidth),
+            static_cast<uint32_t>(inputHeight),
+            static_cast<uint32_t>(outputWidth),
+            static_cast<uint32_t>(outputHeight),
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT
+        );
+        g_context.fsrResourcesPoisoned = true;
+        return 2;
     }
     restoreAndBlit(commandBuffer, color, depth, destination, outputWidth, outputHeight);
     g_lastError.clear();

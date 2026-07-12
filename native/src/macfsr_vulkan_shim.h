@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-bool macfsr_load_vulkan(VkInstance instance, VkDevice device);
+bool macfsr_load_vulkan(VkInstance instance, VkDevice device, PFN_vkGetInstanceProcAddr suppliedGetInstanceProcAddr);
 void macfsr_unload_vulkan(void);
 const char* macfsr_vulkan_error(void);
 
@@ -28,4 +28,3 @@ void VKAPI_PTR macfsr_vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevi
 #ifdef __cplusplus
 }
 #endif
-

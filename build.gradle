@@ -13,6 +13,13 @@ base {
 loom {
     splitEnvironmentSourceSets()
 
+    runs {
+        client {
+            // The mod targets Minecraft 26.2's Vulkan backend; force it for dev validation.
+            programArgs "--graphicsBackend", "vulkan"
+        }
+    }
+
     mods {
         macfsrmc {
             sourceSet sourceSets.main
@@ -84,9 +91,11 @@ processResources {
     if (!project.hasProperty("skipNative")) {
         dependsOn tasks.named("buildNative")
     }
-    from(nativeOutput) {
-        into "natives"
-        include "**/*.dll", "**/*.dylib", "**/*.so"
+    if (!project.hasProperty("skipNative")) {
+        from(nativeOutput) {
+            into "natives"
+            include "**/*.dll", "**/*.dylib", "**/*.so"
+        }
     }
 }
 

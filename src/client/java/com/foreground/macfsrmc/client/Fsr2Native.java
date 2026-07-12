@@ -6,6 +6,10 @@ final class Fsr2Native {
 
     static native boolean initialize(long instance, long physicalDevice, long device, boolean debugLogging);
 
+    /**
+     * @return 1 when FSR 2 was recorded, 2 when the native bridge recorded a
+     *         layout-safe linear fallback, or 0 when no usable work was recorded.
+     */
     static native int dispatch(
         long commandBuffer,
         long colorImage,

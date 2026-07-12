@@ -33,6 +33,8 @@ export JAVA_HOME="$(/usr/libexec/java_home -v 25)" # macOS
 
 The built mod is written to `build/libs/macfsrmc-1.0.0.jar`. `processResources` builds and packages the native library for the current host. Use `-PskipNative` only for Java-only development checks.
 
+The GitHub Actions workflow builds and tests native jars for Windows x86-64, Linux x86-64/ARM64, and macOS Intel/Apple Silicon. It also publishes a `macfsrmc-universal` workflow artifact containing one `macfsrmc-<version>-universal.jar` with all five supported native libraries and a SHA-256 checksum. These CI binaries are not code-signed or notarized.
+
 ## Run in development
 
 Select **Prefer Vulkan (Experimental)** in Minecraft's Video Settings, or set the equivalent option in the dev profile, then run:

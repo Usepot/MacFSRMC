@@ -40,6 +40,8 @@ public final class Fsr2Controller implements AutoCloseable {
     private State state = State.UNINITIALIZED;
     private VulkanDevice vulkanDevice;
     private int consecutiveFailures;
+    private boolean skipCurrentTemporalFrame;
+    private boolean loggedSuccessfulDispatch;
 
     public Fsr2Controller(Fsr2Config config) {
         this.config = config;
@@ -67,6 +69,16 @@ public final class Fsr2Controller implements AutoCloseable {
                 return false;
             }
 
+            if (!Fsr2VulkanBootstrap.isEnabled()) {
+                if (this.state == State.UNINITIALIZED) {
+                    MacFsrMc.LOGGER.warn(
+                        "FSR 2 requires Vulkan shaderStorageImageExtendedFormats to be enabled during device creation"
+                    );
+                }
+                this.state = State.UNSUPPORTED;
+                return false;
+            }
+
             if (this.vulkanDevice != activeVulkanDevice || this.state != State.READY) {
                 NativeLibraryLoader.load();
                 long instance = activeVulkanDevice.instance().vkInstance().address();
@@ -78,6 +90,7 @@ public final class Fsr2Controller implements AutoCloseable {
                 this.vulkanDevice = activeVulkanDevice;
                 this.state = State.READY;
                 this.temporalHistory.invalidate();
+                this.loggedSuccessfulDispatch = false;
                 MacFsrMc.LOGGER.info(
                     "FSR 2.2.1 ready: {}x{} -> {}x{} ({} mode, RCAS={})",
                     inputWidth,
@@ -104,6 +117,7 @@ public final class Fsr2Controller implements AutoCloseable {
         int inputHeight,
         int outputWidth
     ) {
+        this.skipCurrentTemporalFrame = false;
         this.temporalHistory.beginFrame(
             worldToken,
             cameraX,
@@ -117,7 +131,22 @@ public final class Fsr2Controller implements AutoCloseable {
     }
 
     public Matrix4f jitterProjection(Matrix4fc baseProjection, Matrix4fc viewRotation) {
-        return this.temporalHistory.jitterProjection(baseProjection, viewRotation);
+        Matrix4f original = new Matrix4f(baseProjection);
+        if (!original.isFinite() || !new Matrix4f(viewRotation).isFinite()) {
+            this.skipCurrentTemporalFrame = true;
+            this.temporalHistory.invalidate();
+            MacFsrMc.LOGGER.debug("Skipping FSR 2 temporal history for a bootstrap frame with an invalid camera matrix");
+            return original;
+        }
+
+        try {
+            return this.temporalHistory.jitterProjection(original, viewRotation);
+        } catch (IllegalArgumentException exception) {
+            this.skipCurrentTemporalFrame = true;
+            this.temporalHistory.invalidate();
+            MacFsrMc.LOGGER.debug("Skipping FSR 2 temporal history for a non-invertible camera frame", exception);
+            return original;
+        }
     }
 
     public boolean upscale(RenderTarget input, RenderTarget output) {
@@ -137,31 +166,36 @@ public final class Fsr2Controller implements AutoCloseable {
         VulkanCommandEncoder encoder = this.vulkanDevice.createCommandEncoder();
         VkCommandBuffer commandBuffer = encoder.allocateAndBeginTransientCommandBuffer();
         boolean recordedFsr = false;
+        boolean recordedNativeFallback = false;
+        boolean skippedTemporalFrame = this.skipCurrentTemporalFrame;
         try {
-            Fsr2Frame frame = this.temporalHistory.frame();
-            int result = Fsr2Native.dispatch(
-                commandBuffer.address(),
-                color.vkImage(),
-                colorView.vkImageView(),
-                depth.vkImage(),
-                depthView.vkImageView(),
-                destination.vkImage(),
-                input.width,
-                input.height,
-                output.width,
-                output.height,
-                frame.currentToPreviousClipArray(),
-                frame.jitterX(),
-                frame.jitterY(),
-                frame.frameTimeMillis(),
-                this.config.sharpness(),
-                frame.reset(),
-                this.config.reactiveMask(),
-                this.config.reactiveScale(),
-                frame.verticalFov()
-            );
-            recordedFsr = result == 1;
-            if (!recordedFsr) {
+            if (!skippedTemporalFrame) {
+                Fsr2Frame frame = this.temporalHistory.frame();
+                int result = Fsr2Native.dispatch(
+                    commandBuffer.address(),
+                    color.vkImage(),
+                    colorView.vkImageView(),
+                    depth.vkImage(),
+                    depthView.vkImageView(),
+                    destination.vkImage(),
+                    input.width,
+                    input.height,
+                    output.width,
+                    output.height,
+                    frame.currentToPreviousClipArray(),
+                    frame.jitterX(),
+                    frame.jitterY(),
+                    frame.frameTimeMillis(),
+                    this.config.sharpness(),
+                    frame.reset(),
+                    this.config.reactiveMask(),
+                    this.config.reactiveScale(),
+                    frame.verticalFov()
+                );
+                recordedFsr = result == 1;
+                recordedNativeFallback = result == 2;
+            }
+            if (!recordedFsr && !recordedNativeFallback) {
                 recordFallbackBlit(commandBuffer, color.vkImage(), destination.vkImage(), input.width, input.height, output.width, output.height);
             }
 
@@ -174,10 +208,24 @@ public final class Fsr2Controller implements AutoCloseable {
             if (recordedFsr) {
                 this.consecutiveFailures = 0;
                 this.temporalHistory.commit();
+                if (!this.loggedSuccessfulDispatch) {
+                    this.loggedSuccessfulDispatch = true;
+                    MacFsrMc.LOGGER.info(
+                        "FSR 2 temporal reconstruction active: official Vulkan pass chain dispatched at {}x{} -> {}x{}",
+                        input.width,
+                        input.height,
+                        output.width,
+                        output.height
+                    );
+                }
                 return true;
             }
 
             this.temporalHistory.invalidate();
+            this.skipCurrentTemporalFrame = false;
+            if (skippedTemporalFrame) {
+                return false;
+            }
             this.consecutiveFailures++;
             String nativeError = Fsr2Native.lastError();
             MacFsrMc.LOGGER.warn("FSR 2 frame fell back to a linear Vulkan blit: {}", nativeError);
@@ -287,6 +335,24 @@ public final class Fsr2Controller implements AutoCloseable {
                 VK12.VK_IMAGE_LAYOUT_GENERAL,
                 region,
                 VK12.VK_FILTER_LINEAR
+            );
+
+            VkImageMemoryBarrier2.Buffer postBlitBarrier = VkImageMemoryBarrier2.calloc(1, stack);
+            postBlitBarrier.get(0)
+                .sType$Default()
+                .srcStageMask(4_096L) // VK_PIPELINE_STAGE_2_TRANSFER_BIT
+                .srcAccessMask(4_096L) // VK_ACCESS_2_TRANSFER_WRITE_BIT
+                .dstStageMask(65_536L) // VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+                .dstAccessMask(32_768L | 65_536L) // VK_ACCESS_2_MEMORY_READ/WRITE_BIT
+                .oldLayout(VK12.VK_IMAGE_LAYOUT_GENERAL)
+                .newLayout(VK12.VK_IMAGE_LAYOUT_GENERAL)
+                .srcQueueFamilyIndex(VK12.VK_QUEUE_FAMILY_IGNORED)
+                .dstQueueFamilyIndex(VK12.VK_QUEUE_FAMILY_IGNORED)
+                .image(destination);
+            setColorRange(postBlitBarrier.get(0).subresourceRange());
+            KHRSynchronization2.vkCmdPipelineBarrier2KHR(
+                commandBuffer,
+                VkDependencyInfo.calloc(stack).sType$Default().pImageMemoryBarriers(postBlitBarrier)
             );
         }
     }

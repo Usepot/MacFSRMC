@@ -3,6 +3,7 @@ package com.foreground.macfsrmc.client;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
 
+import java.util.Arrays;
 import java.util.Objects;
 
 /**
@@ -221,7 +222,9 @@ final class Fsr2TemporalHistory {
     private static Matrix4f finiteCopy(Matrix4fc matrix, String label) {
         Matrix4f copy = new Matrix4f(Objects.requireNonNull(matrix, label));
         if (!copy.isFinite()) {
-            throw new IllegalArgumentException(label + " contains a non-finite value");
+            throw new IllegalArgumentException(
+                label + " contains a non-finite value: " + Arrays.toString(copy.get(new float[16]))
+            );
         }
         return copy;
     }
